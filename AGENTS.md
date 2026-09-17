@@ -137,7 +137,7 @@ model, use `storage="auto"`, and call `.backward(loss)` (writes `param.grad`).
 |---|---|---|
 | `storage` | `"auto"` | `"auto"`: retain GPU snapshots when inputs need grad; `"none"`: forward-only (backward raises) |
 | `sample_steps` | `1` | Sample snapshots / model grads every N steps (receivers stay exact). For `N > 1`, model grads use the rectangle rule: each sampled imaging term is scaled by `N` (`scale = float(sample_steps)` into every kernel). `N = 1` is bitwise identical on every path |
-| `ckpt_steps` | `None` | `None` automatically selects a square-root-scale interval based on `nt`, state size, and `sample_steps`; `0` full snapshot storage; `N > 0` checkpoint every N steps (same grads as full storage at the same `sample_steps`) |
+| `ckpt_steps` | `None` | `None` selects a square-root-scale interval using `nt`, state size, snapshot-stream count, and `sample_steps`, falling back to full storage when checkpoint and snapshot buffers would not be smaller; `0` full snapshot storage; `N > 0` checkpoint every N steps (same grads as full storage at the same `sample_steps`; snapshot capacity is capped by the actual run length) |
 | `accuracy` | `2` | Spatial FD order: 2, 4, 6, or 8 |
 | `pml_width` | `20` | Scalar width or per-side list; `0` disables that side |
 | `pml_freq` | `25.0` | Acoustic/elastic C-PML design frequency (Hz); unused for EM |

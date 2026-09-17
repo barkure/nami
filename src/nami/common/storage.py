@@ -14,10 +14,13 @@ Public knobs on each propagator (defaults in parentheses):
   time steps (receiver traces stay exact).  Larger values save memory but
   approximate the model gradient.
 * ``ckpt_steps`` (``None``): checkpoint schedule.  ``None`` auto-selects
-  ~sqrt of the time axis; ``0`` keeps every sampled snapshot (full
-  storage); ``N > 0`` saves full wavefield state every N steps and
-  replays the segment on backward.  Checkpointing does not change
-  gradients relative to full storage at the same ``sample_steps``.
+  a square-root-scale interval from ``nt``, state size, snapshot-stream
+  count, and ``sample_steps``, falling back to full storage when checkpoint
+  states plus snapshot buffers would not be smaller; ``0`` keeps every
+  sampled snapshot (full storage); ``N > 0`` saves full wavefield state
+  every N steps and replays the segment on backward.  Snapshot capacity is
+  capped by the run length.  Checkpointing does not change gradients
+  relative to full storage at the same ``sample_steps``.
 
 ``compute_checkpoint_plan`` / ``storage_plan`` turn those knobs into
 ``(checkpoint_every, segments, n_snap, n_ckpt)`` for the front ends.
@@ -69,9 +72,7 @@ class SnapshotStorage:
 def resolve_storage(storage):
     """Validate ``storage`` ('auto' or 'none'); return it unchanged."""
     if storage not in ("auto", "none"):
-        raise ValueError(
-            f"storage must be 'auto' or 'none' (got {storage!r})."
-        )
+        raise ValueError(f"storage must be 'auto' or 'none' (got {storage!r}).")
     return storage
 
 
@@ -86,25 +87,40 @@ def check_sample_steps(sample_steps):
     return sample_steps
 
 
+def _check_n_streams(n_streams):
+    """Validate ``n_streams`` (an int >= 1); return it as an int."""
+    try:
+        n_streams = int(n_streams)
+    except (TypeError, ValueError):
+        raise ValueError("n_streams must be an integer >= 1.") from None
+    if n_streams < 1:
+        raise ValueError("n_streams must be >= 1.")
+    return n_streams
+
+
+def _sampled_slots(n_steps, sample_steps):
+    """Snapshot slots covering ``n_steps`` time steps at ``sample_steps``."""
+    return (n_steps + sample_steps - 1) // sample_steps
+
+
 def compute_checkpoint_plan(nt, n_state, sample_steps, n_streams):
     """Auto checkpoint plan: ``(checkpoint_every, segments, n_snap)``.
 
     ``checkpoint_every`` balances the checkpoint-state memory
-    (``nt / C`` states of ``n_state`` fields) against the replay work per
-    segment (``C / sample_steps`` snapshots)::
+    (``nt / C`` states of ``n_state`` fields) against the replay snapshot
+    memory (``n_streams * C / sample_steps`` fields)::
 
-        C* = round(sqrt(n_state * nt * sample_steps / 2))
+        C* = round(sqrt(n_state * nt * sample_steps / n_streams))
 
     clamped to ``nt``.  ``n_snap`` is the snapshot-stream capacity needed
-    for one segment, ``ceil(C* / sample_steps)``.  ``n_streams`` is reserved
-    for future memory-weighted tuning and is not used by the default
-    formula.
+    for one segment, ``ceil(C* / sample_steps)``.
     """
+    n_streams = _check_n_streams(n_streams)
     checkpoint_every = max(
-        1, min(nt, round(math.sqrt(n_state * nt * sample_steps / 2.0)))
+        1, min(nt, round(math.sqrt(n_state * nt * sample_steps / n_streams)))
     )
     segments = checkpoint_segments(nt, checkpoint_every)
-    n_snap = max(1, math.ceil(checkpoint_every / sample_steps))
+    n_snap = _sampled_slots(checkpoint_every, sample_steps)
     return checkpoint_every, segments, n_snap
 
 
@@ -113,23 +129,32 @@ def storage_plan(nt, n_state, sample_steps, n_streams, enabled, ckpt_steps=None)
 
     ``enabled=False`` (forward-only) returns ``(0, [], 0, 0)``.
     ``ckpt_steps`` is the public schedule: ``None`` selects the auto plan,
-    ``0`` keeps every sampled snapshot (full storage), ``N`` checkpoints
-    the wavefield state every N steps.
+    falling back to full storage if checkpoint and snapshot buffers would
+    not be smaller.  ``0`` keeps every sampled snapshot (full storage),
+    ``N`` checkpoints the wavefield state every N steps.
     """
     if not enabled:
         return 0, [], 0, 0
+    n_streams = _check_n_streams(n_streams)
     if ckpt_steps is None:
         ce, segments, n_snap = compute_checkpoint_plan(
-            nt, n_state, sample_steps, n_streams,
+            nt,
+            n_state,
+            sample_steps,
+            n_streams,
         )
-        return ce, segments, n_snap, max(0, (nt - 1) // ce)
+        n_ckpt = max(0, (nt - 1) // ce)
+        full_n_snap = _sampled_slots(nt, sample_steps)
+        if n_state * n_ckpt + n_streams * n_snap >= n_streams * full_n_snap:
+            return 0, [], full_n_snap, 0
+        return ce, segments, n_snap, n_ckpt
     checkpoint_every = int(ckpt_steps)
     if checkpoint_every < 0:
         raise ValueError("ckpt_steps must be >= 0 (or None for auto).")
     if checkpoint_every == 0:
-        return 0, [], (nt + sample_steps - 1) // sample_steps, 0
+        return 0, [], _sampled_slots(nt, sample_steps), 0
     segments = checkpoint_segments(nt, checkpoint_every)
-    n_snap = (checkpoint_every + sample_steps - 1) // sample_steps
+    n_snap = _sampled_slots(min(checkpoint_every, nt), sample_steps)
     n_ckpt = max(0, (nt - 1) // checkpoint_every)
     return checkpoint_every, segments, n_snap, n_ckpt
 
@@ -144,6 +169,5 @@ def checkpoint_segments(nt, checkpoint_every):
     if checkpoint_every is None or checkpoint_every <= 0:
         return []
     return [
-        (s0, min(s0 + checkpoint_every, nt))
-        for s0 in range(0, nt, checkpoint_every)
+        (s0, min(s0 + checkpoint_every, nt)) for s0 in range(0, nt, checkpoint_every)
     ]
